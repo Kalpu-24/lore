@@ -125,6 +125,38 @@ fn a_change_that_fails_keeps_the_last_status_and_selection() {
 }
 
 #[test]
+fn progress_shows_while_running_and_clears_when_the_call_ends() {
+    for outcome in [Ok(()), Err("offline".to_owned())] {
+        let mut model = StatusModel::default();
+        model.start();
+        model.apply(StatusMessage::Progress(
+            "Syncing 1/4 files".to_owned(),
+            Some(0.25),
+        ));
+        assert_eq!(
+            model.note,
+            Some(("Syncing 1/4 files".to_owned(), Some(0.25)))
+        );
+        model.apply(StatusMessage::Complete(outcome));
+        assert!(model.note.is_none());
+    }
+}
+
+#[test]
+fn the_user_outlives_the_status_read_it_preceded() {
+    let mut model = StatusModel::default();
+    model.start();
+    model.apply(StatusMessage::User(Some("ada".to_owned())));
+    model.apply(StatusMessage::Begin);
+    model.apply(StatusMessage::Complete(Ok(())));
+    assert_eq!(model.user.as_deref(), Some("ada"));
+
+    model.start();
+    model.apply(StatusMessage::User(None));
+    assert!(model.user.is_none());
+}
+
+#[test]
 fn begin_replaces_the_last_status_and_its_selection() {
     let mut model = finished(&[("a", Section::Unstaged)]);
     model.toggle(Section::Unstaged, 0);

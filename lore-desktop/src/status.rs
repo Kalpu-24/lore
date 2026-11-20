@@ -135,6 +135,10 @@ pub struct FileRow {
 pub enum StatusMessage {
     /// The status read begins: what follows replaces the last call's results.
     Begin,
+    /// How far a long change has got, and the fraction of it done where the library reports one.
+    Progress(String, Option<f32>),
+    /// The user the instance's remote knows this client as, or `None` when signed out.
+    User(Option<String>),
     Revision(RevisionSummary),
     File(FileRow),
     /// The call finished: `Err` carries the library's error message.
@@ -175,6 +179,22 @@ impl StatusMessage {
                     data.flag_conflict_unresolved != 0,
                 ),
             })),
+            LoreEvent::RevisionSyncProgress(data) => {
+                let done = data.file_update + data.file_delete;
+                let total = data.file_update_total + data.file_delete_total;
+                Some(Self::Progress(
+                    format!("Syncing {done}/{total} files"),
+                    fraction(done as u64, total as u64),
+                ))
+            }
+            LoreEvent::BranchPushFragmentProgress(data) => Some(Self::Progress(
+                format!("Uploading {}/{} fragments", data.complete, data.count),
+                fraction(data.complete, data.count),
+            )),
+            LoreEvent::AuthUserInfo(data) => Some(Self::User(Some(match data.name.as_str() {
+                "" => data.id.as_str().to_owned(),
+                name => name.to_owned(),
+            }))),
             LoreEvent::Complete(data) => Some(Self::Complete(if data.status == 0 {
                 Ok(())
             } else {
@@ -183,6 +203,11 @@ impl StatusMessage {
             _ => None,
         }
     }
+}
+
+/// `done` of `total` as a fraction, or `None` while the total is not known.
+fn fraction(done: u64, total: u64) -> Option<f32> {
+    (total > 0).then(|| (done as f64 / total as f64).min(1.0) as f32)
 }
 
 /// Where the last status call stands.
@@ -205,6 +230,10 @@ pub struct StatusModel {
     /// Indexes into `sections`, which change only on [`StatusMessage::Begin`].
     selected: [BTreeSet<usize>; 3],
     pub progress: Progress,
+    /// The last progress the running call reported.
+    pub note: Option<(String, Option<f32>)>,
+    /// The signed-in user, once a call has read it.
+    pub user: Option<String>,
 }
 
 impl StatusModel {
@@ -212,6 +241,7 @@ impl StatusModel {
     /// change that fails leaves them as they were.
     pub fn start(&mut self) {
         self.progress = Progress::Running;
+        self.note = None;
     }
 
     /// Folds one message of the running call into the state.
@@ -226,6 +256,8 @@ impl StatusModel {
                     selected.clear();
                 }
             }
+            StatusMessage::Progress(label, fraction) => self.note = Some((label, fraction)),
+            StatusMessage::User(user) => self.user = user,
             StatusMessage::Revision(revision) => self.revision = Some(revision),
             StatusMessage::File(file) => self.sections[file.section.index()].push(file),
             StatusMessage::Complete(Ok(())) => {
@@ -233,8 +265,12 @@ impl StatusModel {
                     files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
                 }
                 self.progress = Progress::Done;
+                self.note = None;
             }
-            StatusMessage::Complete(Err(message)) => self.progress = Progress::Failed(message),
+            StatusMessage::Complete(Err(message)) => {
+                self.progress = Progress::Failed(message);
+                self.note = None;
+            }
         }
     }
 

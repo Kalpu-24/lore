@@ -10,6 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use lore::auth::LoreAuthLocalUserInfoArgs;
+use lore::auth::LoreAuthLoginInteractiveArgs;
+use lore::auth::LoreAuthLogoutArgs;
+use lore::branch::LoreBranchPushArgs;
 use lore::call_delegation::run_command;
 use lore::file::LoreFileResetArgs;
 use lore::file::LoreFileStageArgs;
@@ -21,6 +25,7 @@ use lore::interface::LoreRepositoryStatusArgs;
 use lore::interface::LoreString;
 use lore::remote::command::LoreCommand;
 use lore::revision::LoreRevisionCommitArgs;
+use lore::revision::LoreRevisionSyncArgs;
 use parking_lot::Mutex;
 
 use crate::status::StatusMessage;
@@ -39,6 +44,14 @@ pub enum Change {
     Revert(Vec<String>),
     /// Commit the staged files with this message.
     Commit(String),
+    /// Bring the instance to its branch's tip, merging when local and remote have diverged.
+    Sync,
+    /// Push the current branch and its revisions to the remote.
+    Push,
+    /// Sign in to the instance's remote in the browser.
+    LogIn,
+    /// Remove every stored identity for the instance's auth service.
+    LogOut,
 }
 
 /// A call on one repository instance: an optional change, then a status read.
@@ -66,7 +79,10 @@ pub fn spawn_status(
         .spawn(move || run_request(request, sink))
 }
 
+type Sink = Arc<dyn Fn(StatusMessage) + Send + Sync>;
+
 fn run_request(request: StatusRequest, sink: impl Fn(StatusMessage) + Send + Sync + 'static) {
+    let sink: Sink = Arc::new(sink);
     let mut globals = LoreGlobalArgs {
         repository_path: request.instance_path.as_str().into(),
         ..Default::default()
@@ -76,11 +92,12 @@ fn run_request(request: StatusRequest, sink: impl Fn(StatusMessage) + Send + Syn
         return;
     }
     if let Some(command) = change_command(&request.instance_path, request.change)
-        && let Err(message) = run_change(globals.clone(), command)
+        && let Err(message) = run_change(globals.clone(), command, &sink)
     {
         sink(StatusMessage::Complete(Err(message)));
         return;
     }
+    sink(StatusMessage::User(read_user(globals.clone())));
     sink(StatusMessage::Begin);
     let args = LoreRepositoryStatusArgs {
         staged: 1,
@@ -143,20 +160,65 @@ fn change_command(instance_path: &str, change: Change) -> Option<LoreCommand> {
             ..Default::default()
         }
         .into(),
+        // Empty syncs to the branch tip, as `lore sync` does without a revision.
+        Change::Sync => LoreRevisionSyncArgs::default().into(),
+        Change::Push => LoreBranchPushArgs {
+            branch: LoreString::from(""),
+            fast_forward_merge: 0,
+        }
+        .into(),
+        // Empty URLs resolve from the instance's remote.
+        Change::LogIn => LoreAuthLoginInteractiveArgs {
+            remote_url: LoreString::from(""),
+            no_browser: 0,
+            reuse_session: 0,
+        }
+        .into(),
+        Change::LogOut => LoreAuthLogoutArgs {
+            auth_url: LoreString::from(""),
+            resource: LoreString::from(""),
+            user_id: LoreString::from(""),
+        }
+        .into(),
     })
 }
 
-/// Runs `command` to completion and returns the error its `Complete` event reports.
-fn run_change(globals: LoreGlobalArgs, command: LoreCommand) -> Result<(), String> {
+/// Runs `command` to completion, passing its progress to `sink`, and returns the error its
+/// `Complete` event reports.
+fn run_change(globals: LoreGlobalArgs, command: LoreCommand, sink: &Sink) -> Result<(), String> {
     let outcome = Arc::new(Mutex::new(Err(
         "the call ended without reporting".to_owned()
     )));
     let reported = Arc::clone(&outcome);
-    let callback: Box<dyn Fn(&LoreEvent) + Send + Sync> = Box::new(move |event| {
-        if let Some(StatusMessage::Complete(result)) = StatusMessage::from_event(event) {
-            *reported.lock() = result;
-        }
-    });
+    let sink = Arc::clone(sink);
+    let callback: Box<dyn Fn(&LoreEvent) + Send + Sync> =
+        Box::new(move |event| match StatusMessage::from_event(event) {
+            Some(StatusMessage::Complete(result)) => *reported.lock() = result,
+            Some(message @ StatusMessage::Progress(..)) => sink(message),
+            _ => {}
+        });
     run_command(globals, command, Some(callback));
     outcome.lock().clone()
+}
+
+/// The user the instance's remote knows this client as, from the locally stored token, or
+/// `None` when no one is signed in or the call fails.
+fn read_user(globals: LoreGlobalArgs) -> Option<String> {
+    let user = Arc::new(Mutex::new(None));
+    let found = Arc::clone(&user);
+    let callback: Box<dyn Fn(&LoreEvent) + Send + Sync> = Box::new(move |event| {
+        if let Some(StatusMessage::User(name)) = StatusMessage::from_event(event) {
+            *found.lock() = name;
+        }
+    });
+    let args = LoreAuthLocalUserInfoArgs {
+        auth_endpoint: LoreString::from(""),
+        user_ids: LoreArray::default(),
+        with_identity_token: 0,
+        with_access_token: 0,
+        with_claims: 0,
+    };
+    // Without a stored token the call fails; that reads as signed out.
+    run_command(globals, args.into(), Some(callback));
+    user.lock().take()
 }

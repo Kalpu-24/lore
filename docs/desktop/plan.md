@@ -20,13 +20,18 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       `deny.toml` exception for `epaint_default_fonts` (OFL-1.1, Ubuntu-font-1.0).
 
 ## Phase 2 — Daily loop
-- [ ] Open/close instances (tabs), remembered in per-user config.
+- [x] Open/close instances (tabs), remembered in per-user config: eframe's `persistence`
+      storage, saved on exit; the path given on the command line opens as the active tab.
 - [x] Changes view: status (virtualised), stage/unstage, revert, commit with message. Rows select
       by click; Stage/Unstage take the selection or, with none, the whole instance; Revert asks
       first. A change that fails keeps the last status; after one that succeeds the status is read
       again. Checked by hand against a local `loreserver`.
-- [ ] Sync and push, with progress and cancel.
-- [ ] Accounts: login/logout via `lore::auth`.
+- [x] Sync and push, with progress (files synced, fragments uploaded). No cancel: the library has
+      no way to cancel a single call yet.
+- [x] Accounts: login/logout via `lore::auth`. The signed-in user is read from the stored token
+      before each status read; Log in runs the browser login, Log out removes the stored
+      identities for the instance's auth service. Sync, push and the remote state checked by hand
+      against a local `loreserver`; login needs a server with auth configured and is unchecked.
 
 ## Phase 3 — History and branches
 - [ ] History view on `lore::revision_graph` / `lore::log`; revision details.

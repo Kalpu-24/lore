@@ -5,6 +5,7 @@
 use std::process::ExitCode;
 
 use lore_desktop::app::LoreDesktop;
+use lore_desktop::app::remembered_instances;
 
 fn main() -> ExitCode {
     match lore::load_auth_settings() {
@@ -35,7 +36,11 @@ fn main() -> ExitCode {
     let result = eframe::run_native(
         "Lore",
         options,
-        Box::new(|_| Ok(Box::new(LoreDesktop::new(instance_path)))),
+        Box::new(|cc| {
+            let mut app = LoreDesktop::new(remembered_instances(cc.storage), instance_path);
+            app.refresh_all(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     );
 
     lore::shutdown();

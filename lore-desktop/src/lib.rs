@@ -7,5 +7,6 @@
 //! state [`app`] draws.
 
 pub mod app;
+pub mod instance;
 pub mod status;
 pub mod worker;
