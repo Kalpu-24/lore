@@ -7,7 +7,11 @@ use std::sync::mpsc;
 use eframe::egui;
 use egui_extras::Column;
 use egui_extras::TableBuilder;
+use lore::revision::LoreRevisionHistoryArgs;
+use lore::revision::LoreRevisionInfoArgs;
 
+use crate::history::HistoryMessage;
+use crate::history::HistoryModel;
 use crate::status::Progress;
 use crate::status::Section;
 use crate::status::StatusMessage;
@@ -15,6 +19,7 @@ use crate::status::StatusModel;
 use crate::status::action_label;
 use crate::worker::Change;
 use crate::worker::StatusRequest;
+use crate::worker::spawn_read;
 use crate::worker::spawn_status;
 
 const ROW_HEIGHT: f32 = 18.0;
@@ -29,8 +34,55 @@ pub struct Instance {
     commit_message: String,
     /// The running call commits: its message is cleared once the commit succeeds.
     committing: bool,
+    /// The running call commits, syncs or pushes, so the history is read again once it succeeds.
+    moves_branch: bool,
     /// Paths waiting for the user to confirm that their changes are to be discarded.
     pending_revert: Option<Vec<String>>,
+    view: View,
+    history: HistoryModel,
+    /// Messages of the running history call.
+    history_messages: Option<mpsc::Receiver<HistoryMessage>>,
+    /// Messages of the running info call on the selected revision.
+    changes_messages: Option<mpsc::Receiver<HistoryMessage>>,
+}
+
+/// The view a tab shows below its toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Changes,
+    History,
+}
+
+/// Takes every message waiting in `slot`'s channel and passes it to `apply`. Once the call's
+/// thread has ended and its messages are taken, empties `slot` and returns true.
+fn drain<M>(slot: &mut Option<mpsc::Receiver<M>>, mut apply: impl FnMut(M)) -> bool {
+    let Some(receiver) = slot else {
+        return false;
+    };
+    loop {
+        match receiver.try_recv() {
+            Ok(message) => apply(message),
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                *slot = None;
+                return true;
+            }
+        }
+    }
+}
+
+/// A channel whose sender asks `ctx` to repaint after each message, so the window draws it.
+fn repainting_channel<M: Send + 'static>(
+    ctx: &egui::Context,
+) -> (impl Fn(M) + Send + Sync + 'static, mpsc::Receiver<M>) {
+    let (sender, receiver) = mpsc::channel();
+    let repaint = ctx.clone();
+    let sink = move |message| {
+        // The tab may have closed; nothing is left to show the message then.
+        let _ = sender.send(message);
+        repaint.request_repaint();
+    };
+    (sink, receiver)
 }
 
 impl Instance {
@@ -41,7 +93,64 @@ impl Instance {
             messages: None,
             commit_message: String::new(),
             committing: false,
+            moves_branch: false,
             pending_revert: None,
+            view: View::Changes,
+            history: HistoryModel::default(),
+            history_messages: None,
+            changes_messages: None,
+        }
+    }
+
+    /// Reads the branch's history, replacing the last one read.
+    fn load_history(&mut self, ctx: &egui::Context) {
+        if self.history.progress == Progress::Running || self.path().is_empty() {
+            return;
+        }
+        let (sink, receiver) = repainting_channel(ctx);
+        self.history.start();
+        let spawned = spawn_read(
+            self.path(),
+            LoreRevisionHistoryArgs::default().into(),
+            HistoryMessage::from_event,
+            |error| HistoryMessage::Complete(Err(error)),
+            sink,
+        );
+        match spawned {
+            Ok(_) => self.history_messages = Some(receiver),
+            Err(err) => self.history.apply(HistoryMessage::Complete(Err(format!(
+                "could not start a thread: {err}"
+            )))),
+        }
+    }
+
+    /// Selects the revision at `index` and reads the files it changed against its parent.
+    fn select_revision(&mut self, ctx: &egui::Context, index: usize) {
+        let Some(revision) = self.history.revisions.get(index) else {
+            return;
+        };
+        let args = LoreRevisionInfoArgs {
+            revision: revision.revision.as_str().into(),
+            delta: 1,
+            metadata: 0,
+        };
+        let (sink, receiver) = repainting_channel(ctx);
+        self.history.select(index);
+        // A call on a revision selected before is left to finish; its messages go nowhere.
+        let spawned = spawn_read(
+            self.path(),
+            args.into(),
+            HistoryMessage::from_event,
+            |error| HistoryMessage::Complete(Err(error)),
+            sink,
+        );
+        match spawned {
+            Ok(_) => self.changes_messages = Some(receiver),
+            Err(err) => self
+                .history
+                .apply_changes(HistoryMessage::Complete(Err(format!(
+                    "could not start a thread: {err}"
+                )))),
         }
     }
 
@@ -69,21 +178,16 @@ impl Instance {
         if self.status.is_running() || self.instance_path.trim().is_empty() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let repaint = ctx.clone();
+        let (sink, receiver) = repainting_channel(ctx);
         self.committing = matches!(change, Change::Commit(_));
+        self.moves_branch = matches!(change, Change::Commit(_) | Change::Sync | Change::Push);
         let request = StatusRequest {
             instance_path: self.instance_path.trim().to_owned(),
             scan,
             change,
         };
         self.status.start();
-        let spawned = spawn_status(request, move |message| {
-            // The window may have closed; nothing is left to show the message then.
-            let _ = sender.send(message);
-            repaint.request_repaint();
-        });
-        match spawned {
+        match spawn_status(request, sink) {
             Ok(_) => self.messages = Some(receiver),
             Err(err) => self.status.apply(StatusMessage::Complete(Err(format!(
                 "could not start a thread: {err}"
@@ -91,36 +195,43 @@ impl Instance {
         }
     }
 
-    /// Folds the messages the running call has sent since the last frame into the view.
-    pub fn drain_messages(&mut self) {
-        let Some(receiver) = &self.messages else {
-            return;
-        };
-        let mut finished = false;
-        loop {
-            match receiver.try_recv() {
-                Ok(message) => {
-                    finished |= matches!(message, StatusMessage::Complete(_));
-                    // The status read follows only a change that succeeded.
-                    if message == StatusMessage::Begin && self.committing {
-                        self.commit_message.clear();
-                    }
-                    self.status.apply(message);
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if self.status.is_running() {
-                        self.status.apply(StatusMessage::Complete(Err(
-                            "the call ended without reporting".to_owned(),
-                        )));
-                    }
-                    finished = true;
-                    break;
+    /// Folds the messages the running calls have sent since the last frame into the views.
+    pub fn drain_messages(&mut self, ctx: &egui::Context) {
+        let mut moved = false;
+        let finished = drain(&mut self.messages, |message| {
+            // The status read follows only a change that succeeded.
+            if message == StatusMessage::Begin {
+                moved = self.moves_branch;
+                if self.committing {
+                    self.commit_message.clear();
                 }
             }
+            self.status.apply(message);
+        });
+        if finished && self.status.is_running() {
+            self.status.apply(StatusMessage::Complete(Err(
+                "the call ended without reporting".to_owned(),
+            )));
         }
-        if finished {
-            self.messages = None;
+        let finished = drain(&mut self.history_messages, |message| {
+            self.history.apply(message);
+        });
+        if finished && self.history.progress == Progress::Running {
+            self.history.apply(HistoryMessage::Complete(Err(
+                "the call ended without reporting".to_owned(),
+            )));
+        }
+        let finished = drain(&mut self.changes_messages, |message| {
+            self.history.apply_changes(message);
+        });
+        if finished && self.history.changes_progress == Progress::Running {
+            self.history.apply_changes(HistoryMessage::Complete(Err(
+                "the call ended without reporting".to_owned(),
+            )));
+        }
+        // A history read before the branch moved no longer shows it.
+        if moved && self.history.progress != Progress::Idle {
+            self.load_history(ctx);
         }
     }
 
@@ -141,9 +252,18 @@ impl Instance {
                 .clicked();
             if entered || refresh || scan {
                 self.run(ui.ctx(), scan, Change::None);
+                if self.view == View::History {
+                    self.load_history(ui.ctx());
+                }
             }
         });
         ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.view, View::Changes, "Changes");
+            let history = ui.selectable_value(&mut self.view, View::History, "History");
+            if history.clicked() && self.history.progress == Progress::Idle {
+                self.load_history(ui.ctx());
+            }
+            ui.separator();
             let idle = !self.status.is_running() && !self.path().is_empty();
             let mut change = None;
             if ui
@@ -412,17 +532,159 @@ impl Instance {
             self.toolbar(ui);
             ui.add_space(4.0);
         });
-        egui::Panel::bottom("commit").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.commit_box(ui);
-            ui.add_space(4.0);
-        });
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.summary(ui);
-            ui.separator();
-            self.files(ui);
-        });
+        match self.view {
+            View::Changes => {
+                egui::Panel::bottom("commit").show(ui, |ui| {
+                    ui.add_space(4.0);
+                    self.commit_box(ui);
+                    ui.add_space(4.0);
+                });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.summary(ui);
+                    ui.separator();
+                    self.files(ui);
+                });
+            }
+            View::History => {
+                if self.history.selected.is_some() {
+                    egui::Panel::bottom("revision")
+                        .resizable(true)
+                        .default_size(260.0)
+                        .min_size(120.0)
+                        .show(ui, |ui| self.revision_details(ui));
+                }
+                egui::CentralPanel::default().show(ui, |ui| self.revisions(ui));
+            }
+        }
         let ctx = ui.ctx().clone();
         self.confirm_revert(&ctx);
     }
+
+    /// The branch's revisions, newest first; a click selects one to show its changes.
+    fn revisions(&mut self, ui: &mut egui::Ui) {
+        match &self.history.progress {
+            Progress::Running => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "Reading history… {} revisions",
+                        self.history.revisions.len()
+                    ));
+                });
+            }
+            Progress::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Progress::Idle | Progress::Done => {}
+        }
+        let mut clicked = None;
+        let history = &self.history;
+        TableBuilder::new(ui)
+            .striped(true)
+            .sense(egui::Sense::click())
+            .column(Column::exact(60.0))
+            .column(Column::exact(130.0))
+            .column(Column::exact(140.0))
+            .column(Column::remainder())
+            .header(ROW_HEIGHT, |mut header| {
+                for title in ["#", "Date", "Created by", "Message"] {
+                    header.col(|ui| {
+                        ui.weak(title);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, history.revisions.len(), |mut row| {
+                    let index = row.index();
+                    let revision = &history.revisions[index];
+                    row.set_selected(history.selected == Some(index));
+                    row.col(|ui| {
+                        ui.label(revision.number.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(revision.timestamp.map_or_else(String::new, format_time));
+                    });
+                    row.col(|ui| {
+                        ui.label(&revision.created_by);
+                    });
+                    row.col(|ui| {
+                        ui.label(revision.summary());
+                    });
+                    if row.response().clicked() {
+                        clicked = Some(index);
+                    }
+                });
+            });
+        if let Some(index) = clicked {
+            self.select_revision(ui.ctx(), index);
+        }
+    }
+
+    /// The selected revision: its whole message, its parents and the files it changed.
+    fn revision_details(&self, ui: &mut egui::Ui) {
+        let Some(revision) = self.history.selected_revision() else {
+            return;
+        };
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!("Revision {}", revision.number));
+            ui.weak(&revision.revision);
+        });
+        for parent in &revision.parents {
+            ui.weak(format!("Parent {parent}"));
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("message")
+            .max_height(80.0)
+            .show(ui, |ui| {
+                ui.label(&revision.message);
+            });
+        ui.separator();
+        match &self.history.changes_progress {
+            Progress::Running => {
+                ui.spinner();
+            }
+            Progress::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Progress::Idle | Progress::Done => {}
+        }
+        let changes = &self.history.changes;
+        ui.strong(format!("Files changed ({})", changes.len()));
+        ui.push_id("changes", |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .column(Column::exact(80.0))
+                .column(Column::remainder())
+                .column(Column::exact(90.0))
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, changes.len(), |mut row| {
+                        let change = &changes[row.index()];
+                        row.col(|ui| {
+                            ui.label(action_label(change.action));
+                        });
+                        row.col(|ui| match &change.from_path {
+                            Some(from) => {
+                                ui.label(format!("{from} → {}", change.path));
+                            }
+                            None => {
+                                ui.label(&change.path);
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{} B", change.size));
+                        });
+                    });
+                });
+        });
+    }
+}
+
+/// A commit time, in milliseconds since the Unix epoch, as local date and time.
+fn format_time(millis: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(millis as i64).map_or_else(String::new, |time| {
+        time.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    })
 }

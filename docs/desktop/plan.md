@@ -34,7 +34,10 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       against a local `loreserver`; login needs a server with auth configured and is unchecked.
 
 ## Phase 3 — History and branches
-- [ ] History view on `lore::revision_graph` / `lore::log`; revision details.
+- [x] History view; revision details. Built on `revision history` (entries with their message,
+      time and creator) and `revision info` with deltas for the selected revision's files, both
+      read beside the status call. Reloads after a commit, sync or push. Checked by hand against a
+      local `loreserver`.
 - [ ] Diff view: text side-by-side, binary as metadata; size cap.
 - [ ] Branches: list, create, switch; merge with conflict list and resolve mine/theirs.
 

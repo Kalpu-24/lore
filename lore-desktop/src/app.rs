@@ -98,8 +98,9 @@ impl LoreDesktop {
     /// Draws one frame of the window into `ui`.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         // Every tab takes its messages, so a call in a tab out of view still finishes.
+        let ctx = ui.ctx().clone();
         for tab in &mut self.tabs {
-            tab.drain_messages();
+            tab.drain_messages(&ctx);
         }
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(2.0);

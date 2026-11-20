@@ -6,6 +6,7 @@ publish = false
 description = "Lore desktop client"
 
 [dependencies]
+chrono = { workspace = true }
 eframe = { version = "0.37.0", features = ["persistence"] }
 egui_extras = "0.37.0"
 lore = { workspace = true }

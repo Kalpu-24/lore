@@ -3849,6 +3849,7 @@ dependencies = [
 name = "lore-desktop"
 version = "0.14.1-nightly"
 dependencies = [
+ "chrono",
  "eframe",
  "egui_extras",
  "lore",

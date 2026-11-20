@@ -79,6 +79,40 @@ pub fn spawn_status(
         .spawn(move || run_request(request, sink))
 }
 
+/// Runs a read-only `command` on the instance at `instance_path`, on a thread of its own, and
+/// passes the message `map` makes of each event to `sink`. Its last message is the one `map`
+/// makes of the `Complete` event, or the one `fail` makes of the error when the arguments are
+/// refused before the call starts.
+///
+/// Reads may run beside the instance's status call, as the library allows read-only operations
+/// to run concurrently.
+pub fn spawn_read<M: 'static>(
+    instance_path: &str,
+    command: LoreCommand,
+    map: fn(&LoreEvent) -> Option<M>,
+    fail: fn(String) -> M,
+    sink: impl Fn(M) + Send + Sync + 'static,
+) -> std::io::Result<JoinHandle<()>> {
+    let mut globals = LoreGlobalArgs {
+        repository_path: instance_path.into(),
+        ..Default::default()
+    };
+    std::thread::Builder::new()
+        .name("lore-desktop-read".into())
+        .spawn(move || {
+            if let Err(err) = globals.validate() {
+                sink(fail(err.to_string()));
+                return;
+            }
+            let callback: Box<dyn Fn(&LoreEvent) + Send + Sync> = Box::new(move |event| {
+                if let Some(message) = map(event) {
+                    sink(message);
+                }
+            });
+            run_command(globals, command, Some(callback));
+        })
+}
+
 type Sink = Arc<dyn Fn(StatusMessage) + Send + Sync>;
 
 fn run_request(request: StatusRequest, sink: impl Fn(StatusMessage) + Send + Sync + 'static) {
