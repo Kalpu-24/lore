@@ -7,5 +7,6 @@ mod branches;
 mod diff;
 mod history;
 mod locks;
+mod notify;
 mod status;
 mod worker;

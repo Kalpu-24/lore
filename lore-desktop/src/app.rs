@@ -14,6 +14,8 @@ const OPEN_INSTANCES: &str = "open_instances";
 pub struct LoreDesktop {
     tabs: Vec<Instance>,
     active: usize,
+    /// The window had focus last frame.
+    focused: bool,
 }
 
 impl LoreDesktop {
@@ -35,7 +37,11 @@ impl LoreDesktop {
         if tabs.is_empty() {
             tabs.push(Instance::new(String::new()));
         }
-        Self { tabs, active }
+        Self {
+            tabs,
+            active,
+            focused: true,
+        }
     }
 
     /// Reads every open instance's status.
@@ -99,7 +105,13 @@ impl LoreDesktop {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         // Every tab takes its messages, so a call in a tab out of view still finishes.
         let ctx = ui.ctx().clone();
+        let focused = ui.input(|input| input.focused);
+        let gained_focus = focused && !self.focused;
+        self.focused = focused;
         for tab in &mut self.tabs {
+            if gained_focus {
+                tab.focused();
+            }
             tab.drain_messages(&ctx);
         }
         egui::Panel::top("tabs").show(ui, |ui| {

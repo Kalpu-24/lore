@@ -54,7 +54,12 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       holder, since), locks a typed path and releases the selected locks; Changes locks the
       selected files. Release names no owner, so the remote refuses locks the user doesn't hold.
       Checked by hand against a local `loreserver`.
-- [ ] Live updates through `lore::notification`; refresh-on-focus fallback.
+- [x] Live updates through `lore::notification`; refresh-on-focus fallback. Each tab subscribes
+      once its status is read; a push, branch change or lock marks it stale, and it reads its
+      views again when its own call is done. Without notifications it refreshes when the window
+      gains focus, and every tab shows when it was last updated. The library keeps one
+      subscription per repository, so two tabs on the same repository share one. Checked by hand
+      against a local `loreserver`: a clone's push, lock and unlock each arrived.
 
 ## Phase 5 — Ship
 - [ ] Packaging per platform; CI build of the client.

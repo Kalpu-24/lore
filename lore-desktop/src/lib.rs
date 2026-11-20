@@ -12,5 +12,6 @@ pub mod diff;
 pub mod history;
 pub mod instance;
 pub mod locks;
+pub mod notify;
 pub mod status;
 pub mod worker;

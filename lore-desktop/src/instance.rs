@@ -12,6 +12,8 @@ use lore::file::DEFAULT_CONTEXT_LINES;
 use lore::file::LoreFileDiffArgs;
 use lore::interface::LoreArray;
 use lore::lock::LoreLockFileQueryArgs;
+use lore::notification::LoreNotificationSubscribeArgs;
+use lore::notification::LoreNotificationUnsubscribeArgs;
 use lore::revision::LoreRevisionHistoryArgs;
 use lore::revision::LoreRevisionInfoArgs;
 
@@ -25,6 +27,9 @@ use crate::history::HistoryMessage;
 use crate::history::HistoryModel;
 use crate::locks::LockMessage;
 use crate::locks::LockModel;
+use crate::notify::Live;
+use crate::notify::LiveModel;
+use crate::notify::NotifyMessage;
 use crate::status::Progress;
 use crate::status::Section;
 use crate::status::StatusMessage;
@@ -72,6 +77,16 @@ pub struct Instance {
     lock_messages: Option<mpsc::Receiver<LockMessage>>,
     /// The path typed to lock, relative to the instance's root.
     lock_path: String,
+    live: LiveModel,
+    live_messages: Option<mpsc::Receiver<NotifyMessage>>,
+    /// When the status was last read.
+    updated: Option<chrono::DateTime<chrono::Local>>,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
 }
 
 /// The view a tab shows below its toolbar.
@@ -138,6 +153,73 @@ impl Instance {
             locks: LockModel::default(),
             lock_messages: None,
             lock_path: String::new(),
+            live: LiveModel::default(),
+            live_messages: None,
+            updated: None,
+        }
+    }
+
+    /// Subscribes to the remote's notifications for the instance, once its status has been read,
+    /// replacing a subscription for an instance the tab showed before.
+    fn subscribe(&mut self, ctx: &egui::Context) {
+        if self.live.path.as_deref() == Some(self.path()) {
+            return;
+        }
+        self.unsubscribe();
+        let (sink, receiver) = repainting_channel(ctx);
+        let path = self.path().to_owned();
+        self.live.start(&path);
+        match spawn_read(
+            self.path(),
+            LoreNotificationSubscribeArgs {}.into(),
+            NotifyMessage::from_event,
+            NotifyMessage::Failed,
+            sink,
+        ) {
+            Ok(_) => self.live_messages = Some(receiver),
+            Err(err) => self.live.apply(NotifyMessage::Failed(format!(
+                "could not start a thread: {err}"
+            ))),
+        }
+    }
+
+    /// Ends the tab's subscription, if it has one.
+    // ponytail: the library keeps one subscription per repository, so two tabs on instances of
+    // the same repository share it, and closing one ends the other's live updates until it
+    // switches instance; track subscribers per repository if that matters.
+    fn unsubscribe(&mut self) {
+        self.live_messages = None;
+        let Some(path) = self.live.path.take() else {
+            return;
+        };
+        if self.live.live == Live::On {
+            let _ = spawn_read(
+                &path,
+                LoreNotificationUnsubscribeArgs {}.into(),
+                |_| None::<()>,
+                |_| (),
+                |()| {},
+            );
+        }
+        self.live.live = Live::Off;
+    }
+
+    /// The window gained focus.
+    pub fn focused(&mut self) {
+        self.live.focused();
+    }
+
+    /// Reads the status and every view the tab has read before, as Refresh does.
+    fn refresh_views(&mut self, ctx: &egui::Context) {
+        self.run(ctx, false, Change::None);
+        if self.history.progress != Progress::Idle {
+            self.load_history(ctx);
+        }
+        if self.branches.progress != Progress::Idle {
+            self.load_branches(ctx);
+        }
+        if self.locks.progress != Progress::Idle {
+            self.load_locks(ctx);
         }
     }
 
@@ -336,6 +418,7 @@ impl Instance {
     pub fn drain_messages(&mut self, ctx: &egui::Context) {
         let mut moved = false;
         let mut locked = false;
+        let mut read = false;
         let finished = drain(&mut self.messages, |message| {
             // The status read follows only a change that succeeded.
             if message == StatusMessage::Begin {
@@ -345,8 +428,13 @@ impl Instance {
                     self.commit_message.clear();
                 }
             }
+            read |= message == StatusMessage::Complete(Ok(()));
             self.status.apply(message);
         });
+        if read {
+            self.updated = Some(chrono::Local::now());
+            self.subscribe(ctx);
+        }
         if finished && self.status.is_running() {
             self.status.apply(StatusMessage::Complete(Err(
                 "the call ended without reporting".to_owned(),
@@ -402,6 +490,11 @@ impl Instance {
         // Switching branches changes which branch's locks the view lists.
         if (moved || locked) && self.locks.progress != Progress::Idle {
             self.load_locks(ctx);
+        }
+        drain(&mut self.live_messages, |message| self.live.apply(message));
+        // A change the remote reported waits for the tab's own call to finish, so none is lost.
+        if !self.status.is_running() && self.live.take_stale() {
+            self.refresh_views(ctx);
         }
     }
 
@@ -484,6 +577,22 @@ impl Instance {
     }
 
     fn summary(&mut self, ui: &mut egui::Ui) {
+        if let Some(updated) = self.updated {
+            let updated = format!("Updated {}", updated.format("%H:%M:%S"));
+            match &self.live.live {
+                Live::On => {
+                    ui.weak(format!("{updated} · live"))
+                        .on_hover_text("Refreshes when someone pushes, branches or locks");
+                }
+                Live::Unavailable(reason) => {
+                    ui.weak(format!("{updated} · refreshes when the window gains focus"))
+                        .on_hover_text(format!("No live updates: {reason}"));
+                }
+                Live::Off | Live::Subscribing => {
+                    ui.weak(updated);
+                }
+            }
+        }
         match &self.status.progress {
             Progress::Idle => {
                 ui.label("Enter the path of a repository instance and press Refresh.");
