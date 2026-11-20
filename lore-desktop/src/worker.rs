@@ -29,6 +29,8 @@ use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreRepositoryStatusArgs;
 use lore::interface::LoreString;
+use lore::lock::LoreLockFileAcquireArgs;
+use lore::lock::LoreLockFileReleaseArgs;
 use lore::remote::command::LoreCommand;
 use lore::revision::LoreRevisionCommitArgs;
 use lore::revision::LoreRevisionSyncArgs;
@@ -70,6 +72,10 @@ pub enum Change {
     KeepTheirs(Vec<String>),
     /// Abandon the merge in progress, returning the files to the current revision.
     AbortMerge,
+    /// Lock these paths, relative to the instance's root, on the current branch.
+    Lock(Vec<String>),
+    /// Release the locks on these paths, relative to the instance's root, on the current branch.
+    Unlock(Vec<String>),
 }
 
 /// A call on one repository instance: an optional change, then a status read.
@@ -267,6 +273,20 @@ fn change_command(instance_path: &str, change: Change) -> Option<LoreCommand> {
         Change::AbortMerge => LoreBranchMergeAbortArgs {
             link: LoreString::from(""),
             ignore_links: 0,
+        }
+        .into(),
+        // An empty branch is the current one.
+        Change::Lock(list) => LoreLockFileAcquireArgs {
+            paths: paths(list),
+            branch: LoreString::from(""),
+        }
+        .into(),
+        // With no owner named, the remote releases only what this user may release.
+        Change::Unlock(list) => LoreLockFileReleaseArgs {
+            paths: paths(list),
+            branch: LoreString::from(""),
+            owner: LoreString::from(""),
+            owner_id: LoreString::from(""),
         }
         .into(),
     })

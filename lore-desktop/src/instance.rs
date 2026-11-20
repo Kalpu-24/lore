@@ -11,6 +11,7 @@ use lore::branch::LoreBranchListArgs;
 use lore::file::DEFAULT_CONTEXT_LINES;
 use lore::file::LoreFileDiffArgs;
 use lore::interface::LoreArray;
+use lore::lock::LoreLockFileQueryArgs;
 use lore::revision::LoreRevisionHistoryArgs;
 use lore::revision::LoreRevisionInfoArgs;
 
@@ -22,6 +23,8 @@ use crate::diff::DiffModel;
 use crate::diff::RowKind;
 use crate::history::HistoryMessage;
 use crate::history::HistoryModel;
+use crate::locks::LockMessage;
+use crate::locks::LockModel;
 use crate::status::Progress;
 use crate::status::Section;
 use crate::status::StatusMessage;
@@ -48,6 +51,8 @@ pub struct Instance {
     /// The running call moves the branch or changes which one is current, so the history and
     /// branches are read again once it succeeds.
     moves_branch: bool,
+    /// The running call takes or releases locks, so the locks are read again once it succeeds.
+    changes_locks: bool,
     /// A change that discards work, waiting for the user to confirm it.
     pending_confirm: Option<Change>,
     view: View,
@@ -63,6 +68,10 @@ pub struct Instance {
     branch_messages: Option<mpsc::Receiver<BranchMessage>>,
     /// The name typed for a new branch.
     new_branch: String,
+    locks: LockModel,
+    lock_messages: Option<mpsc::Receiver<LockMessage>>,
+    /// The path typed to lock, relative to the instance's root.
+    lock_path: String,
 }
 
 /// The view a tab shows below its toolbar.
@@ -71,6 +80,7 @@ pub enum View {
     Changes,
     History,
     Branches,
+    Locks,
 }
 
 /// Takes every message waiting in `slot`'s channel and passes it to `apply`. Once the call's
@@ -114,6 +124,7 @@ impl Instance {
             commit_message: String::new(),
             committing: false,
             moves_branch: false,
+            changes_locks: false,
             pending_confirm: None,
             view: View::Changes,
             history: HistoryModel::default(),
@@ -124,6 +135,41 @@ impl Instance {
             branches: BranchModel::default(),
             branch_messages: None,
             new_branch: String::new(),
+            locks: LockModel::default(),
+            lock_messages: None,
+            lock_path: String::new(),
+        }
+    }
+
+    /// Reads the locks the remote holds on the current branch, or on every branch while the
+    /// current one is not yet known.
+    fn load_locks(&mut self, ctx: &egui::Context) {
+        if self.locks.progress == Progress::Running || self.path().is_empty() {
+            return;
+        }
+        let branch = self
+            .status
+            .revision
+            .as_ref()
+            .map_or("", |revision| revision.branch.as_str());
+        let args = LoreLockFileQueryArgs {
+            branch: branch.into(),
+            owner: "".into(),
+            path: "".into(),
+        };
+        let (sink, receiver) = repainting_channel(ctx);
+        self.locks.start();
+        match spawn_read(
+            self.path(),
+            args.into(),
+            LockMessage::from_event,
+            |error| LockMessage::Complete(Err(error)),
+            sink,
+        ) {
+            Ok(_) => self.lock_messages = Some(receiver),
+            Err(err) => self.locks.apply(LockMessage::Complete(Err(format!(
+                "could not start a thread: {err}"
+            )))),
         }
     }
 
@@ -261,15 +307,17 @@ impl Instance {
         }
         let (sink, receiver) = repainting_channel(ctx);
         self.committing = matches!(change, Change::Commit(_));
-        self.moves_branch = !matches!(
-            change,
-            Change::None
-                | Change::Stage(_)
-                | Change::Unstage(_)
-                | Change::Revert(_)
-                | Change::LogIn
-                | Change::LogOut
-        );
+        self.changes_locks = matches!(change, Change::Lock(_) | Change::Unlock(_));
+        self.moves_branch = !self.changes_locks
+            && !matches!(
+                change,
+                Change::None
+                    | Change::Stage(_)
+                    | Change::Unstage(_)
+                    | Change::Revert(_)
+                    | Change::LogIn
+                    | Change::LogOut
+            );
         let request = StatusRequest {
             instance_path: self.instance_path.trim().to_owned(),
             scan,
@@ -287,10 +335,12 @@ impl Instance {
     /// Folds the messages the running calls have sent since the last frame into the views.
     pub fn drain_messages(&mut self, ctx: &egui::Context) {
         let mut moved = false;
+        let mut locked = false;
         let finished = drain(&mut self.messages, |message| {
             // The status read follows only a change that succeeded.
             if message == StatusMessage::Begin {
                 moved = self.moves_branch;
+                locked = self.changes_locks;
                 if self.committing {
                     self.commit_message.clear();
                 }
@@ -341,6 +391,18 @@ impl Instance {
         if moved && self.branches.progress != Progress::Idle {
             self.load_branches(ctx);
         }
+        let finished = drain(&mut self.lock_messages, |message| {
+            self.locks.apply(message);
+        });
+        if finished && self.locks.progress == Progress::Running {
+            self.locks.apply(LockMessage::Complete(Err(
+                "the call ended without reporting".to_owned(),
+            )));
+        }
+        // Switching branches changes which branch's locks the view lists.
+        if (moved || locked) && self.locks.progress != Progress::Idle {
+            self.load_locks(ctx);
+        }
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -364,6 +426,7 @@ impl Instance {
                     View::Changes => {}
                     View::History => self.load_history(ui.ctx()),
                     View::Branches => self.load_branches(ui.ctx()),
+                    View::Locks => self.load_locks(ui.ctx()),
                 }
             }
         });
@@ -376,6 +439,10 @@ impl Instance {
             let branches = ui.selectable_value(&mut self.view, View::Branches, "Branches");
             if branches.clicked() && self.branches.progress == Progress::Idle {
                 self.load_branches(ui.ctx());
+            }
+            let locks = ui.selectable_value(&mut self.view, View::Locks, "Locks");
+            if locks.clicked() && self.locks.progress == Progress::Idle {
+                self.load_locks(ui.ctx());
             }
             ui.separator();
             let idle = !self.status.is_running() && !self.path().is_empty();
@@ -549,6 +616,12 @@ impl Instance {
             .on_disabled_hover_text("Select one file to see its changes");
         if diff.clicked() {
             self.open_diff(ui.ctx(), &selected[0], "", "");
+        }
+        let lock = ui
+            .add_enabled(idle && !selected.is_empty(), egui::Button::new("Lock"))
+            .on_hover_text("Lock the selected files so no one else can change them on this branch");
+        if lock.clicked() {
+            return Some(Change::Lock(selected));
         }
         None
     }
@@ -733,6 +806,9 @@ impl Instance {
             }
             View::Branches => {
                 egui::CentralPanel::default().show(ui, |ui| self.branch_list(ui));
+            }
+            View::Locks => {
+                egui::CentralPanel::default().show(ui, |ui| self.lock_list(ui));
             }
         }
         let ctx = ui.ctx().clone();
@@ -987,6 +1063,108 @@ impl Instance {
             if matches!(change, Change::CreateBranch(_)) {
                 self.new_branch.clear();
             }
+            self.run(ui.ctx(), false, change);
+        }
+    }
+
+    /// The locks the remote holds on the current branch, with locking a path and releasing the
+    /// selected locks.
+    fn lock_list(&mut self, ui: &mut egui::Ui) {
+        let idle = !self.status.is_running();
+        let mut change = None;
+        ui.horizontal(|ui| {
+            let path = ui.add(
+                egui::TextEdit::singleline(&mut self.lock_path)
+                    .hint_text("path to lock, from the instance's root")
+                    .desired_width(280.0),
+            );
+            let entered = path.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let ready = idle && !self.lock_path.trim().is_empty();
+            let lock = ui
+                .add_enabled(ready, egui::Button::new("Lock"))
+                .on_hover_text("Lock the file so no one else can change it on this branch");
+            if ready && (entered || lock.clicked()) {
+                change = Some(Change::Lock(vec![self.lock_path.trim().to_owned()]));
+                self.lock_path.clear();
+            }
+            ui.separator();
+            let selected = self.locks.selected_paths();
+            let unlock = ui
+                .add_enabled(
+                    idle && !selected.is_empty(),
+                    egui::Button::new(format!("Unlock {} selected", selected.len())),
+                )
+                .on_hover_text(
+                    "Release the selected locks; the remote refuses locks you don't hold",
+                )
+                .on_disabled_hover_text("Select locks to release");
+            if unlock.clicked() {
+                change = Some(Change::Unlock(selected));
+            }
+        });
+        match &self.status.progress {
+            Progress::Running => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Working…");
+                });
+            }
+            Progress::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Progress::Idle | Progress::Done => {}
+        }
+        match &self.locks.progress {
+            Progress::Running => {
+                ui.spinner();
+            }
+            Progress::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Progress::Done if self.locks.rows.is_empty() => {
+                ui.label("No files are locked on this branch.");
+            }
+            Progress::Idle | Progress::Done => {}
+        }
+        ui.separator();
+        let mut clicked = None;
+        let locks = &self.locks;
+        TableBuilder::new(ui)
+            .striped(true)
+            .sense(egui::Sense::click())
+            .column(Column::remainder())
+            .column(Column::exact(180.0))
+            .column(Column::exact(130.0))
+            .header(ROW_HEIGHT, |mut header| {
+                for title in ["Path", "Held by", "Since"] {
+                    header.col(|ui| {
+                        ui.weak(title);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, locks.rows.len(), |mut row| {
+                    let index = row.index();
+                    let lock = &locks.rows[index];
+                    row.set_selected(locks.is_selected(index));
+                    row.col(|ui| {
+                        ui.label(&lock.path);
+                    });
+                    row.col(|ui| {
+                        ui.label(&lock.owner);
+                    });
+                    row.col(|ui| {
+                        ui.label(format_time(lock.locked_at));
+                    });
+                    if row.response().clicked() {
+                        clicked = Some(index);
+                    }
+                });
+            });
+        if let Some(index) = clicked {
+            self.locks.toggle(index);
+        }
+        if let Some(change) = change {
             self.run(ui.ctx(), false, change);
         }
     }

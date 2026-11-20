@@ -50,7 +50,10 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       conflict, abort, merge again, keep theirs, commit.
 
 ## Phase 4 — Collaboration
-- [ ] Locks view: holders, lock/unlock.
+- [x] Locks view: holders, lock/unlock. A Locks view lists the current branch's locks (path,
+      holder, since), locks a typed path and releases the selected locks; Changes locks the
+      selected files. Release names no owner, so the remote refuses locks the user doesn't hold.
+      Checked by hand against a local `loreserver`.
 - [ ] Live updates through `lore::notification`; refresh-on-focus fallback.
 
 ## Phase 5 — Ship

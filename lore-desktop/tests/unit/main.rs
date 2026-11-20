@@ -6,5 +6,6 @@ mod app;
 mod branches;
 mod diff;
 mod history;
+mod locks;
 mod status;
 mod worker;
