@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 //! The working tree status view's model: what a status call reported, folded from its events.
 
+use std::collections::BTreeSet;
+
 use lore::interface::LoreEvent;
 use lore::interface::LoreFileAction;
 
@@ -27,6 +29,7 @@ pub enum RemoteState {
 impl RemoteState {
     /// Classifies the flags a status call reports for the active branch, as `lore status` reads
     /// them.
+    #[allow(clippy::fn_params_excessive_bools)]
     pub fn classify(
         available: bool,
         authorized: bool,
@@ -130,6 +133,8 @@ pub struct FileRow {
 /// What a status call reports, copied out of its events, which live only for their callback.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatusMessage {
+    /// The status read begins: what follows replaces the last call's results.
+    Begin,
     Revision(RevisionSummary),
     File(FileRow),
     /// The call finished: `Err` carries the library's error message.
@@ -191,27 +196,36 @@ pub enum Progress {
     Failed(String),
 }
 
-/// The status view's state: the last status call's results, by section.
+/// The status view's state: the last status call's results, by section, and the rows selected
+/// in each.
 #[derive(Debug, Default)]
 pub struct StatusModel {
     pub revision: Option<RevisionSummary>,
     sections: [Vec<FileRow>; 3],
+    /// Indexes into `sections`, which change only on [`StatusMessage::Begin`].
+    selected: [BTreeSet<usize>; 3],
     pub progress: Progress,
 }
 
 impl StatusModel {
-    /// Clears the results of the last call, for a new one.
+    /// Marks a call running. The last call's results stay until its status read begins, so a
+    /// change that fails leaves them as they were.
     pub fn start(&mut self) {
-        self.revision = None;
-        for files in &mut self.sections {
-            files.clear();
-        }
         self.progress = Progress::Running;
     }
 
     /// Folds one message of the running call into the state.
     pub fn apply(&mut self, message: StatusMessage) {
         match message {
+            StatusMessage::Begin => {
+                self.revision = None;
+                for files in &mut self.sections {
+                    files.clear();
+                }
+                for selected in &mut self.selected {
+                    selected.clear();
+                }
+            }
             StatusMessage::Revision(revision) => self.revision = Some(revision),
             StatusMessage::File(file) => self.sections[file.section.index()].push(file),
             StatusMessage::Complete(Ok(())) => {
@@ -230,6 +244,27 @@ impl StatusModel {
 
     pub fn is_running(&self) -> bool {
         self.progress == Progress::Running
+    }
+
+    /// Selects the row at `index` in `section`, or clears it if it was selected.
+    pub fn toggle(&mut self, section: Section, index: usize) {
+        let selected = &mut self.selected[section.index()];
+        if !selected.remove(&index) {
+            selected.insert(index);
+        }
+    }
+
+    pub fn is_selected(&self, section: Section, index: usize) -> bool {
+        self.selected[section.index()].contains(&index)
+    }
+
+    /// The paths of the rows selected in `section`, in display order.
+    pub fn selected_paths(&self, section: Section) -> Vec<String> {
+        let files = self.files(section);
+        self.selected[section.index()]
+            .iter()
+            .map(|&index| files[index].path.clone())
+            .collect()
     }
 }
 

@@ -80,6 +80,7 @@ fn remote_state_without_divergence() {
 fn files_go_to_their_section_and_sort_on_completion() {
     let mut model = StatusModel::default();
     model.start();
+    model.apply(StatusMessage::Begin);
     for message in [
         file("b", Section::Staged),
         file("c", Section::Unstaged),
@@ -97,16 +98,61 @@ fn files_go_to_their_section_and_sort_on_completion() {
     assert_eq!(paths(&model, Section::Unstaged), ["c"]);
 }
 
-#[test]
-fn failure_keeps_the_error_and_start_clears_the_last_call() {
+/// A model holding `files` from a finished call, each with its section.
+fn finished(files: &[(&str, Section)]) -> StatusModel {
     let mut model = StatusModel::default();
     model.start();
-    model.apply(file("a", Section::Unstaged));
-    model.apply(StatusMessage::Complete(Err("no instance".to_owned())));
-    assert!(matches!(model.progress, Progress::Failed(_)));
+    model.apply(StatusMessage::Begin);
+    for (path, section) in files {
+        model.apply(file(path, *section));
+    }
+    model.apply(StatusMessage::Complete(Ok(())));
+    model
+}
+
+#[test]
+fn a_change_that_fails_keeps_the_last_status_and_selection() {
+    let mut model = finished(&[("a", Section::Unstaged)]);
+    model.toggle(Section::Unstaged, 0);
 
     model.start();
     assert_eq!(model.progress, Progress::Running);
+    model.apply(StatusMessage::Complete(Err("no instance".to_owned())));
+
+    assert!(matches!(model.progress, Progress::Failed(_)));
+    assert_eq!(paths(&model, Section::Unstaged), ["a"]);
+    assert_eq!(model.selected_paths(Section::Unstaged), ["a"]);
+}
+
+#[test]
+fn begin_replaces_the_last_status_and_its_selection() {
+    let mut model = finished(&[("a", Section::Unstaged)]);
+    model.toggle(Section::Unstaged, 0);
+
+    model.start();
+    model.apply(StatusMessage::Begin);
+
     assert!(model.files(Section::Unstaged).is_empty());
+    assert!(model.selected_paths(Section::Unstaged).is_empty());
     assert!(model.revision.is_none());
+}
+
+#[test]
+fn selection_toggles_per_section_in_display_order() {
+    let mut model = finished(&[
+        ("c", Section::Unstaged),
+        ("a", Section::Unstaged),
+        ("b", Section::Unstaged),
+        ("s", Section::Staged),
+    ]);
+    // Rows sort on completion, so index 2 is "c" and index 0 is "a".
+    model.toggle(Section::Unstaged, 2);
+    model.toggle(Section::Unstaged, 0);
+    assert_eq!(model.selected_paths(Section::Unstaged), ["a", "c"]);
+    assert!(model.selected_paths(Section::Staged).is_empty());
+
+    model.toggle(Section::Unstaged, 2);
+    assert_eq!(model.selected_paths(Section::Unstaged), ["a"]);
+    assert!(model.is_selected(Section::Unstaged, 0));
+    assert!(!model.is_selected(Section::Unstaged, 2));
 }

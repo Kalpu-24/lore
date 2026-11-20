@@ -14,12 +14,17 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
 - [x] Plumbing: each call on its own thread via `run_command`, events copied into messages on a
       channel, UI repaints on each; errors from the `Complete` event shown in the window.
 - [x] Read-only status view: refresh / scan, branch and remote state, virtualised file tables.
-- [ ] Measure frame time on a large instance.
-- [ ] `cargo deny` passes with egui's dependency tree.
+- [x] Measure frame time on a large instance. `tests/unit/app.rs` draws the status headless: 100 and
+      1,000,000 rows both draw 136 shapes, at 0.14 and 0.22 ms of CPU a frame (release, Windows).
+- [x] `cargo deny` passes with egui's dependency tree: edition 2024 like the workspace, and a
+      `deny.toml` exception for `epaint_default_fonts` (OFL-1.1, Ubuntu-font-1.0).
 
 ## Phase 2 — Daily loop
 - [ ] Open/close instances (tabs), remembered in per-user config.
-- [ ] Changes view: status (virtualised), stage/unstage, revert, commit with message.
+- [x] Changes view: status (virtualised), stage/unstage, revert, commit with message. Rows select
+      by click; Stage/Unstage take the selection or, with none, the whole instance; Revert asks
+      first. A change that fails keeps the last status; after one that succeeds the status is read
+      again. Checked by hand against a local `loreserver`.
 - [ ] Sync and push, with progress and cancel.
 - [ ] Accounts: login/logout via `lore::auth`.
 

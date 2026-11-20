@@ -167,7 +167,7 @@ sends no telemetry of its own; library telemetry follows the library's existing 
   change and its own LEP first.
 - **Assumption:** A pure-Rust toolkit renders large virtualised lists and text diffs well on all three
   platforms. — *invalidated if:* the prototype in phase 1 of the plan cannot keep frame time steady on a
-  status list of {TODO: target size} entries.
+  status list of 1,000,000 entries.
 
 **Risks**
 

@@ -2,4 +2,6 @@
 // SPDX-License-Identifier: MIT
 //! The crate's tests that can share a process, as one integration-test binary.
 
+mod app;
 mod status;
+mod worker;

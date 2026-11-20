@@ -9,9 +9,14 @@ description = "Lore desktop client"
 eframe = "0.37.0"
 egui_extras = "0.37.0"
 lore = { workspace = true }
+lore-macro = { workspace = true }
 parking_lot = { workspace = true }
 
+[features]
+test-util = []
+
 [dev-dependencies]
+lore-desktop = { path = ".", features = ["test-util"] }
 
 [[bin]]
 name = "lore-desktop"
