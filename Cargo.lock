@@ -3855,6 +3855,7 @@ dependencies = [
  "lore",
  "lore-desktop",
  "lore-macro",
+ "lore-revision",
  "parking_lot",
 ]
 

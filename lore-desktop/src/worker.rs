@@ -152,23 +152,28 @@ fn run_request(request: StatusRequest, sink: impl Fn(StatusMessage) + Send + Syn
     run_command(globals, args.into(), Some(callback));
 }
 
-/// The library command for `change`, with its paths made absolute under `instance_path`, since
-/// the library resolves a relative path against the process's working directory.
+/// `path`, relative to the instance's root, as the absolute path the library takes: it resolves
+/// a relative path against the process's working directory. The empty path is the root.
+pub fn absolute_path(instance_path: &str, path: &str) -> LoreString {
+    match path {
+        "" => LoreString::from(instance_path),
+        path => LoreString::from(
+            Path::new(instance_path)
+                .join(path)
+                .to_string_lossy()
+                .as_ref(),
+        ),
+    }
+}
+
+/// The library command for `change`, with its paths made absolute under `instance_path`.
 #[lore_macro::test_pub]
 fn change_command(instance_path: &str, change: Change) -> Option<LoreCommand> {
     let paths = |paths: Vec<String>| {
         LoreArray::from_vec(
             paths
                 .iter()
-                .map(|path| match path.as_str() {
-                    "" => LoreString::from(instance_path),
-                    path => LoreString::from(
-                        Path::new(instance_path)
-                            .join(path)
-                            .to_string_lossy()
-                            .as_ref(),
-                    ),
-                })
+                .map(|path| absolute_path(instance_path, path))
                 .collect(),
         )
     };

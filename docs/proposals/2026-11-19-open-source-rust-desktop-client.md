@@ -135,7 +135,8 @@ views show their last refresh time and refresh on focus.
   repository lock against other processes, such as a CLI run at the same time. After any operation the client
   re-reads state from the library rather than assuming its own result.
 - **Memory** — Preserved: lists are streamed from events and virtualised; the client buffers no file content
-  except the diff currently shown, which it caps and pages. {TODO: diff size cap.}
+  except the diff currently shown, which it caps at 1 MB of patch text per file and draws only
+  the rows in view.
 - **Statelessness** — The client keeps view state for its own window only. It keeps no repository state the
   library does not own, so closing it at any time loses nothing.
 - **Determinism** — Preserved: the client adds no behaviour of its own to an operation.

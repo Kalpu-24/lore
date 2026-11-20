@@ -18,6 +18,8 @@ test-util = []
 
 [dev-dependencies]
 lore-desktop = { path = ".", features = ["test-util"] }
+# Only to build library events in tests; the client reaches the library through `lore` alone.
+lore-revision = { workspace = true }
 
 [[bin]]
 name = "lore-desktop"

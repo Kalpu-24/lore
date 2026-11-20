@@ -38,7 +38,10 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       time and creator) and `revision info` with deltas for the selected revision's files, both
       read beside the status call. Reloads after a commit, sync or push. Checked by hand against a
       local `loreserver`.
-- [ ] Diff view: text side-by-side, binary as metadata; size cap.
+- [x] Diff view: text side-by-side, binary as metadata; size cap. `file diff` patches laid out
+      side by side, cut at 1 MB per file. Opened with Diff on one selected file in Changes (working
+      tree against the current revision), or by clicking a file of a revision in History
+      (against its parent). Checked by hand against a local `loreserver`.
 - [ ] Branches: list, create, switch; merge with conflict list and resolve mine/theirs.
 
 ## Phase 4 — Collaboration

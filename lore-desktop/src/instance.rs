@@ -7,9 +7,16 @@ use std::sync::mpsc;
 use eframe::egui;
 use egui_extras::Column;
 use egui_extras::TableBuilder;
+use lore::file::DEFAULT_CONTEXT_LINES;
+use lore::file::LoreFileDiffArgs;
+use lore::interface::LoreArray;
 use lore::revision::LoreRevisionHistoryArgs;
 use lore::revision::LoreRevisionInfoArgs;
 
+use crate::diff::DIFF_CAP;
+use crate::diff::DiffMessage;
+use crate::diff::DiffModel;
+use crate::diff::RowKind;
 use crate::history::HistoryMessage;
 use crate::history::HistoryModel;
 use crate::status::Progress;
@@ -19,6 +26,7 @@ use crate::status::StatusModel;
 use crate::status::action_label;
 use crate::worker::Change;
 use crate::worker::StatusRequest;
+use crate::worker::absolute_path;
 use crate::worker::spawn_read;
 use crate::worker::spawn_status;
 
@@ -44,6 +52,9 @@ pub struct Instance {
     history_messages: Option<mpsc::Receiver<HistoryMessage>>,
     /// Messages of the running info call on the selected revision.
     changes_messages: Option<mpsc::Receiver<HistoryMessage>>,
+    /// The diff shown beside the view it was opened from.
+    diff: Option<(View, DiffModel)>,
+    diff_messages: Option<mpsc::Receiver<DiffMessage>>,
 }
 
 /// The view a tab shows below its toolbar.
@@ -99,7 +110,44 @@ impl Instance {
             history: HistoryModel::default(),
             history_messages: None,
             changes_messages: None,
+            diff: None,
+            diff_messages: None,
         }
+    }
+
+    /// Shows the diff of `path`, relative to the instance's root, from the `source` revision to
+    /// the `target` one, beside the current view. An empty source is the current revision and an
+    /// empty target the working tree, as for `lore file diff`.
+    fn open_diff(&mut self, ctx: &egui::Context, path: &str, source: &str, target: &str) {
+        let sides = match (source, target) {
+            ("", "") => "current revision → working tree".to_owned(),
+            (source, target) => format!("{} → {}", short(source), short(target)),
+        };
+        let args = LoreFileDiffArgs {
+            paths: LoreArray::from_vec(vec![absolute_path(self.path(), path)]),
+            source_revision: source.into(),
+            target_revision: target.into(),
+            diff3: 0,
+            context_lines: DEFAULT_CONTEXT_LINES,
+            ignore_whitespace_eol: 0,
+            ignore_whitespace_inline: 0,
+        };
+        let (sink, receiver) = repainting_channel(ctx);
+        let mut diff = DiffModel::start(path.to_owned(), sides);
+        // A diff opened before is left to finish; its messages go nowhere.
+        match spawn_read(
+            self.path(),
+            args.into(),
+            DiffMessage::from_event,
+            |error| DiffMessage::Complete(Err(error)),
+            sink,
+        ) {
+            Ok(_) => self.diff_messages = Some(receiver),
+            Err(err) => diff.apply(DiffMessage::Complete(Err(format!(
+                "could not start a thread: {err}"
+            )))),
+        }
+        self.diff = Some((self.view, diff));
     }
 
     /// Reads the branch's history, replacing the last one read.
@@ -228,6 +276,14 @@ impl Instance {
             self.history.apply_changes(HistoryMessage::Complete(Err(
                 "the call ended without reporting".to_owned(),
             )));
+        }
+        if let Some((_, diff)) = &mut self.diff {
+            let finished = drain(&mut self.diff_messages, |message| diff.apply(message));
+            if finished && diff.progress == Progress::Running {
+                diff.apply(DiffMessage::Complete(Err(
+                    "the call ended without reporting".to_owned(),
+                )));
+            }
         }
         // A history read before the branch moved no longer shows it.
         if moved && self.history.progress != Progress::Idle {
@@ -393,6 +449,13 @@ impl Instance {
             // Resolving conflicts belongs to the merge view.
             Section::Unmerged => {}
         }
+        let diff = ui
+            .add_enabled(selected.len() == 1, egui::Button::new("Diff"))
+            .on_hover_text("Show the selected file's changes against the current revision")
+            .on_disabled_hover_text("Select one file to see its changes");
+        if diff.clicked() {
+            self.open_diff(ui.ctx(), &selected[0], "", "");
+        }
         None
     }
 
@@ -532,6 +595,13 @@ impl Instance {
             self.toolbar(ui);
             ui.add_space(4.0);
         });
+        if matches!(&self.diff, Some((view, _)) if *view == self.view) {
+            egui::Panel::right("diff")
+                .resizable(true)
+                .default_size(ui.available_width() * 0.55)
+                .min_size(240.0)
+                .show(ui, |ui| self.diff_panel(ui));
+        }
         match self.view {
             View::Changes => {
                 egui::Panel::bottom("commit").show(ui, |ui| {
@@ -621,10 +691,11 @@ impl Instance {
     }
 
     /// The selected revision: its whole message, its parents and the files it changed.
-    fn revision_details(&self, ui: &mut egui::Ui) {
+    fn revision_details(&mut self, ui: &mut egui::Ui) {
         let Some(revision) = self.history.selected_revision() else {
             return;
         };
+        let mut clicked = None;
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!("Revision {}", revision.number));
@@ -650,10 +721,16 @@ impl Instance {
             Progress::Idle | Progress::Done => {}
         }
         let changes = &self.history.changes;
-        ui.strong(format!("Files changed ({})", changes.len()));
+        // The first revision has no parent to show its files' changes against.
+        let parent = revision.parents.first();
+        let title = ui.strong(format!("Files changed ({})", changes.len()));
+        if parent.is_some() {
+            title.on_hover_text("Click a file to see its changes");
+        }
         ui.push_id("changes", |ui| {
             TableBuilder::new(ui)
                 .striped(true)
+                .sense(egui::Sense::click())
                 .column(Column::exact(80.0))
                 .column(Column::remainder())
                 .column(Column::exact(90.0))
@@ -674,10 +751,103 @@ impl Instance {
                         row.col(|ui| {
                             ui.label(format!("{} B", change.size));
                         });
+                        if row.response().clicked() {
+                            clicked = Some(change.path.clone());
+                        }
                     });
                 });
         });
+        if let (Some(path), Some(parent)) = (clicked, parent.cloned()) {
+            let target = revision.revision.clone();
+            self.open_diff(ui.ctx(), &path, &parent, &target);
+        }
     }
+
+    /// The open diff, side by side: the old file's lines on the left, the new file's on the right.
+    fn diff_panel(&mut self, ui: &mut egui::Ui) {
+        let Some((_, diff)) = &self.diff else {
+            return;
+        };
+        let mut close = false;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            close = ui
+                .small_button("×")
+                .on_hover_text("Close the diff")
+                .clicked();
+            ui.strong(&diff.path);
+        });
+        ui.weak(&diff.sides);
+        match &diff.progress {
+            Progress::Running => {
+                ui.spinner();
+            }
+            Progress::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Progress::Done if diff.rows.is_empty() => {
+                ui.label("No differences.");
+            }
+            Progress::Idle | Progress::Done => {}
+        }
+        if diff.cut {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "The diff is cut at {} MB; the rest is not shown.",
+                    DIFF_CAP >> 20
+                ),
+            );
+        }
+        ui.separator();
+        let removed = ui.visuals().error_fg_color;
+        let added = egui::Color32::from_rgb(0x3f, 0xa3, 0x4d);
+        let text_width = ((ui.available_width() - 2.0 * 44.0) / 2.0).max(80.0);
+        let rows = &diff.rows;
+        TableBuilder::new(ui)
+            .striped(false)
+            .column(Column::exact(40.0))
+            .column(Column::exact(text_width).clip(true))
+            .column(Column::exact(40.0))
+            .column(Column::remainder().clip(true))
+            .body(|body| {
+                body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                    let line = &rows[row.index()];
+                    if matches!(line.kind, RowKind::Hunk | RowKind::Note) {
+                        row.col(|_| {});
+                        row.col(|ui| {
+                            ui.weak(egui::RichText::new(&line.text).monospace());
+                        });
+                        row.col(|_| {});
+                        row.col(|_| {});
+                        return;
+                    }
+                    for (side, colour) in [(&line.old, removed), (&line.new, added)] {
+                        let changed = line.kind != RowKind::Context;
+                        row.col(|ui| {
+                            if let Some((number, _)) = side {
+                                ui.weak(number.to_string());
+                            }
+                        });
+                        row.col(|ui| {
+                            if let Some((_, text)) = side {
+                                let text = egui::RichText::new(text).monospace();
+                                ui.label(if changed { text.color(colour) } else { text });
+                            }
+                        });
+                    }
+                });
+            });
+        if close {
+            self.diff = None;
+            self.diff_messages = None;
+        }
+    }
+}
+
+/// The start of a revision hash, enough to tell revisions apart in a header.
+fn short(revision: &str) -> &str {
+    &revision[..revision.len().min(12)]
 }
 
 /// A commit time, in milliseconds since the Unix epoch, as local date and time.
