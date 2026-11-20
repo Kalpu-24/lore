@@ -13,7 +13,13 @@ use std::thread::JoinHandle;
 use lore::auth::LoreAuthLocalUserInfoArgs;
 use lore::auth::LoreAuthLoginInteractiveArgs;
 use lore::auth::LoreAuthLogoutArgs;
+use lore::branch::LoreBranchCreateArgs;
+use lore::branch::LoreBranchMergeAbortArgs;
+use lore::branch::LoreBranchMergeResolveMineArgs;
+use lore::branch::LoreBranchMergeResolveTheirsArgs;
+use lore::branch::LoreBranchMergeStartArgs;
 use lore::branch::LoreBranchPushArgs;
+use lore::branch::LoreBranchSwitchArgs;
 use lore::call_delegation::run_command;
 use lore::file::LoreFileResetArgs;
 use lore::file::LoreFileStageArgs;
@@ -52,6 +58,18 @@ pub enum Change {
     LogIn,
     /// Remove every stored identity for the instance's auth service.
     LogOut,
+    /// Create a branch of this name at the current revision; the instance moves to it.
+    CreateBranch(String),
+    /// Switch the instance to the branch of this name.
+    Switch(String),
+    /// Merge the branch of this name into the current one, committing when nothing conflicts.
+    Merge(String),
+    /// Resolve these conflicted paths by keeping the current branch's side.
+    KeepMine(Vec<String>),
+    /// Resolve these conflicted paths by taking the incoming branch's side.
+    KeepTheirs(Vec<String>),
+    /// Abandon the merge in progress, returning the files to the current revision.
+    AbortMerge,
 }
 
 /// A call on one repository instance: an optional change, then a status read.
@@ -217,6 +235,38 @@ fn change_command(instance_path: &str, change: Change) -> Option<LoreCommand> {
             auth_url: LoreString::from(""),
             resource: LoreString::from(""),
             user_id: LoreString::from(""),
+        }
+        .into(),
+        Change::CreateBranch(name) => LoreBranchCreateArgs {
+            branch: name.as_str().into(),
+            category: LoreString::from(""),
+            id: LoreString::from(""),
+        }
+        .into(),
+        Change::Switch(name) => LoreBranchSwitchArgs {
+            branch: name.as_str().into(),
+            revision: LoreString::from(""),
+            reset: 0,
+            bare: 0,
+        }
+        .into(),
+        // An empty message lets the library write the merge's own, as `lore merge` does.
+        Change::Merge(name) => LoreBranchMergeStartArgs {
+            branch: name.as_str().into(),
+            message: LoreString::from(""),
+            no_commit: 0,
+            link: LoreString::from(""),
+            ignore_links: 0,
+            inherit_metadata: LoreArray::default(),
+            link_paths: LoreArray::default(),
+            link_messages: LoreArray::default(),
+        }
+        .into(),
+        Change::KeepMine(list) => LoreBranchMergeResolveMineArgs { paths: paths(list) }.into(),
+        Change::KeepTheirs(list) => LoreBranchMergeResolveTheirsArgs { paths: paths(list) }.into(),
+        Change::AbortMerge => LoreBranchMergeAbortArgs {
+            link: LoreString::from(""),
+            ignore_links: 0,
         }
         .into(),
     })

@@ -7,12 +7,15 @@ use std::sync::mpsc;
 use eframe::egui;
 use egui_extras::Column;
 use egui_extras::TableBuilder;
+use lore::branch::LoreBranchListArgs;
 use lore::file::DEFAULT_CONTEXT_LINES;
 use lore::file::LoreFileDiffArgs;
 use lore::interface::LoreArray;
 use lore::revision::LoreRevisionHistoryArgs;
 use lore::revision::LoreRevisionInfoArgs;
 
+use crate::branches::BranchMessage;
+use crate::branches::BranchModel;
 use crate::diff::DIFF_CAP;
 use crate::diff::DiffMessage;
 use crate::diff::DiffModel;
@@ -42,10 +45,11 @@ pub struct Instance {
     commit_message: String,
     /// The running call commits: its message is cleared once the commit succeeds.
     committing: bool,
-    /// The running call commits, syncs or pushes, so the history is read again once it succeeds.
+    /// The running call moves the branch or changes which one is current, so the history and
+    /// branches are read again once it succeeds.
     moves_branch: bool,
-    /// Paths waiting for the user to confirm that their changes are to be discarded.
-    pending_revert: Option<Vec<String>>,
+    /// A change that discards work, waiting for the user to confirm it.
+    pending_confirm: Option<Change>,
     view: View,
     history: HistoryModel,
     /// Messages of the running history call.
@@ -55,6 +59,10 @@ pub struct Instance {
     /// The diff shown beside the view it was opened from.
     diff: Option<(View, DiffModel)>,
     diff_messages: Option<mpsc::Receiver<DiffMessage>>,
+    branches: BranchModel,
+    branch_messages: Option<mpsc::Receiver<BranchMessage>>,
+    /// The name typed for a new branch.
+    new_branch: String,
 }
 
 /// The view a tab shows below its toolbar.
@@ -62,6 +70,7 @@ pub struct Instance {
 pub enum View {
     Changes,
     History,
+    Branches,
 }
 
 /// Takes every message waiting in `slot`'s channel and passes it to `apply`. Once the call's
@@ -105,13 +114,37 @@ impl Instance {
             commit_message: String::new(),
             committing: false,
             moves_branch: false,
-            pending_revert: None,
+            pending_confirm: None,
             view: View::Changes,
             history: HistoryModel::default(),
             history_messages: None,
             changes_messages: None,
             diff: None,
             diff_messages: None,
+            branches: BranchModel::default(),
+            branch_messages: None,
+            new_branch: String::new(),
+        }
+    }
+
+    /// Reads the instance's branches, replacing the last list read.
+    fn load_branches(&mut self, ctx: &egui::Context) {
+        if self.branches.progress == Progress::Running || self.path().is_empty() {
+            return;
+        }
+        let (sink, receiver) = repainting_channel(ctx);
+        self.branches.start();
+        match spawn_read(
+            self.path(),
+            LoreBranchListArgs { archived: 0 }.into(),
+            BranchMessage::from_event,
+            |error| BranchMessage::Complete(Err(error)),
+            sink,
+        ) {
+            Ok(_) => self.branch_messages = Some(receiver),
+            Err(err) => self.branches.apply(BranchMessage::Complete(Err(format!(
+                "could not start a thread: {err}"
+            )))),
         }
     }
 
@@ -228,7 +261,15 @@ impl Instance {
         }
         let (sink, receiver) = repainting_channel(ctx);
         self.committing = matches!(change, Change::Commit(_));
-        self.moves_branch = matches!(change, Change::Commit(_) | Change::Sync | Change::Push);
+        self.moves_branch = !matches!(
+            change,
+            Change::None
+                | Change::Stage(_)
+                | Change::Unstage(_)
+                | Change::Revert(_)
+                | Change::LogIn
+                | Change::LogOut
+        );
         let request = StatusRequest {
             instance_path: self.instance_path.trim().to_owned(),
             scan,
@@ -285,9 +326,20 @@ impl Instance {
                 )));
             }
         }
-        // A history read before the branch moved no longer shows it.
+        let finished = drain(&mut self.branch_messages, |message| {
+            self.branches.apply(message);
+        });
+        if finished && self.branches.progress == Progress::Running {
+            self.branches.apply(BranchMessage::Complete(Err(
+                "the call ended without reporting".to_owned(),
+            )));
+        }
+        // A history or branch list read before the branch moved no longer shows it.
         if moved && self.history.progress != Progress::Idle {
             self.load_history(ctx);
+        }
+        if moved && self.branches.progress != Progress::Idle {
+            self.load_branches(ctx);
         }
     }
 
@@ -308,8 +360,10 @@ impl Instance {
                 .clicked();
             if entered || refresh || scan {
                 self.run(ui.ctx(), scan, Change::None);
-                if self.view == View::History {
-                    self.load_history(ui.ctx());
+                match self.view {
+                    View::Changes => {}
+                    View::History => self.load_history(ui.ctx()),
+                    View::Branches => self.load_branches(ui.ctx()),
                 }
             }
         });
@@ -318,6 +372,10 @@ impl Instance {
             let history = ui.selectable_value(&mut self.view, View::History, "History");
             if history.clicked() && self.history.progress == Progress::Idle {
                 self.load_history(ui.ctx());
+            }
+            let branches = ui.selectable_value(&mut self.view, View::Branches, "Branches");
+            if branches.clicked() && self.branches.progress == Progress::Idle {
+                self.load_branches(ui.ctx());
             }
             ui.separator();
             let idle = !self.status.is_running() && !self.path().is_empty();
@@ -358,7 +416,7 @@ impl Instance {
         });
     }
 
-    fn summary(&self, ui: &mut egui::Ui) {
+    fn summary(&mut self, ui: &mut egui::Ui) {
         match &self.status.progress {
             Progress::Idle => {
                 ui.label("Enter the path of a repository instance and press Refresh.");
@@ -397,8 +455,15 @@ impl Instance {
                 if let Some(incoming) = &revision.pending_merge {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
-                        format!("Merge in progress, incoming {incoming}"),
+                        format!("Merge in progress, incoming {}", short(incoming)),
                     );
+                    let abort = ui
+                        .add_enabled(!self.status.is_running(), egui::Button::new("Abort merge…"))
+                        .on_hover_text("Discard the merge and return to the current revision");
+                    if abort.clicked() {
+                        self.pending_confirm = Some(Change::AbortMerge);
+                    }
+                    ui.weak("Resolve the conflicts, then commit to finish the merge.");
                 }
             });
         }
@@ -432,7 +497,7 @@ impl Instance {
                     .add_enabled(idle && !selected.is_empty(), egui::Button::new("Revert…"))
                     .on_hover_text("Discard the selected files' changes");
                 if revert.clicked() {
-                    self.pending_revert = Some(selected.clone());
+                    self.pending_confirm = Some(Change::Revert(selected.clone()));
                 }
             }
             Section::Staged => {
@@ -446,8 +511,37 @@ impl Instance {
                     return Some(Change::Unstage(all_or_selected()));
                 }
             }
-            // Resolving conflicts belongs to the merge view.
-            Section::Unmerged => {}
+            Section::Unmerged => {
+                let conflicts = if selected.is_empty() {
+                    self.status
+                        .files(Section::Unmerged)
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect()
+                } else {
+                    selected.clone()
+                };
+                if ui
+                    .add_enabled(
+                        idle,
+                        egui::Button::new(format!("Keep mine ({})", scope(&selected))),
+                    )
+                    .on_hover_text("Resolve by keeping the current branch's version")
+                    .clicked()
+                {
+                    return Some(Change::KeepMine(conflicts));
+                }
+                if ui
+                    .add_enabled(
+                        idle,
+                        egui::Button::new(format!("Keep theirs ({})", scope(&selected))),
+                    )
+                    .on_hover_text("Resolve by taking the incoming branch's version")
+                    .clicked()
+                {
+                    return Some(Change::KeepTheirs(conflicts));
+                }
+            }
         }
         let diff = ui
             .add_enabled(selected.len() == 1, egui::Button::new("Diff"))
@@ -555,19 +649,31 @@ impl Instance {
     }
 
     /// Asks the user to confirm a revert, which discards changes the library cannot restore.
-    fn confirm_revert(&mut self, ctx: &egui::Context) {
-        let Some(paths) = &self.pending_revert else {
-            return;
+    fn confirm(&mut self, ctx: &egui::Context) {
+        let (heading, detail, action) = match &self.pending_confirm {
+            Some(Change::Revert(paths)) => (
+                "Revert changes?",
+                format!(
+                    "Discard the changes to {} file(s)? This cannot be undone.",
+                    paths.len()
+                ),
+                "Revert",
+            ),
+            Some(Change::AbortMerge) => (
+                "Abort the merge?",
+                "Discard the merge in progress, with every conflict resolved so far, and return \
+                 the files to the current revision?"
+                    .to_owned(),
+                "Abort merge",
+            ),
+            _ => return,
         };
         let mut answer = None;
-        let modal = egui::Modal::new(egui::Id::unique("confirm-revert")).show(ctx, |ui| {
-            ui.heading("Revert changes?");
-            ui.label(format!(
-                "Discard the changes to {} file(s)? This cannot be undone.",
-                paths.len()
-            ));
+        let modal = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
+            ui.heading(heading);
+            ui.label(detail);
             ui.horizontal(|ui| {
-                if ui.button("Revert").clicked() {
+                if ui.button(action).clicked() {
                     answer = Some(true);
                 }
                 if ui.button("Cancel").clicked() {
@@ -579,10 +685,10 @@ impl Instance {
             answer = Some(false);
         }
         if let Some(confirmed) = answer
-            && let Some(paths) = self.pending_revert.take()
+            && let Some(change) = self.pending_confirm.take()
             && confirmed
         {
-            self.run(ctx, false, Change::Revert(paths));
+            self.run(ctx, false, change);
         }
     }
 }
@@ -625,9 +731,12 @@ impl Instance {
                 }
                 egui::CentralPanel::default().show(ui, |ui| self.revisions(ui));
             }
+            View::Branches => {
+                egui::CentralPanel::default().show(ui, |ui| self.branch_list(ui));
+            }
         }
         let ctx = ui.ctx().clone();
-        self.confirm_revert(&ctx);
+        self.confirm(&ctx);
     }
 
     /// The branch's revisions, newest first; a click selects one to show its changes.
@@ -760,6 +869,125 @@ impl Instance {
         if let (Some(path), Some(parent)) = (clicked, parent.cloned()) {
             let target = revision.revision.clone();
             self.open_diff(ui.ctx(), &path, &parent, &target);
+        }
+    }
+
+    /// The instance's branches, with creating one, switching to one and merging one into the
+    /// current branch.
+    fn branch_list(&mut self, ui: &mut egui::Ui) {
+        let idle = !self.status.is_running();
+        let mut change = None;
+        ui.horizontal(|ui| {
+            let name = ui.add(
+                egui::TextEdit::singleline(&mut self.new_branch)
+                    .hint_text("new branch name")
+                    .desired_width(220.0),
+            );
+            let entered = name.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let ready = idle && !self.new_branch.trim().is_empty();
+            let create = ui
+                .add_enabled(ready, egui::Button::new("Create"))
+                .on_hover_text("Create a branch at the current revision and switch to it");
+            if ready && (entered || create.clicked()) {
+                change = Some(Change::CreateBranch(self.new_branch.trim().to_owned()));
+            }
+            ui.separator();
+            let selected = self.branches.selected_row().filter(|row| !row.current);
+            let name = selected.map(|row| row.name.clone());
+            let switch = ui
+                .add_enabled(idle && name.is_some(), egui::Button::new("Switch"))
+                .on_hover_text("Bring the working tree to the selected branch")
+                .on_disabled_hover_text("Select a branch other than the current one");
+            if let (true, Some(name)) = (switch.clicked(), &name) {
+                change = Some(Change::Switch(name.clone()));
+            }
+            let merge = ui
+                .add_enabled(
+                    idle && name.is_some(),
+                    egui::Button::new("Merge into current"),
+                )
+                .on_hover_text(
+                    "Merge the selected branch into the current one; conflicts appear in Changes",
+                )
+                .on_disabled_hover_text("Select a branch other than the current one");
+            if let (true, Some(name)) = (merge.clicked(), name) {
+                change = Some(Change::Merge(name));
+            }
+        });
+        match &self.status.progress {
+            Progress::Running => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(self.status.note.as_ref().map_or("Working…", |n| &n.0));
+                });
+            }
+            Progress::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Progress::Idle | Progress::Done => {}
+        }
+        match &self.branches.progress {
+            Progress::Running => {
+                ui.spinner();
+            }
+            Progress::Failed(message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Progress::Idle | Progress::Done => {}
+        }
+        ui.separator();
+        let mut clicked = None;
+        let branches = &self.branches;
+        TableBuilder::new(ui)
+            .striped(true)
+            .sense(egui::Sense::click())
+            .column(Column::exact(20.0))
+            .column(Column::remainder())
+            .column(Column::exact(70.0))
+            .column(Column::exact(120.0))
+            .header(ROW_HEIGHT, |mut header| {
+                for title in ["", "Branch", "Where", "Latest"] {
+                    header.col(|ui| {
+                        ui.weak(title);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, branches.rows.len(), |mut row| {
+                    let index = row.index();
+                    let branch = &branches.rows[index];
+                    row.set_selected(branches.selected == Some(index));
+                    row.col(|ui| {
+                        if branch.current {
+                            ui.strong("●").on_hover_text("The current branch");
+                        }
+                    });
+                    row.col(|ui| {
+                        if branch.current {
+                            ui.strong(&branch.name);
+                        } else {
+                            ui.label(&branch.name);
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(if branch.remote { "remote" } else { "local" });
+                    });
+                    row.col(|ui| {
+                        ui.weak(short(&branch.latest));
+                    });
+                    if row.response().clicked() {
+                        clicked = Some(index);
+                    }
+                });
+            });
+        if let Some(index) = clicked {
+            self.branches.selected = Some(index);
+        }
+        if let Some(change) = change {
+            if matches!(change, Change::CreateBranch(_)) {
+                self.new_branch.clear();
+            }
+            self.run(ui.ctx(), false, change);
         }
     }
 

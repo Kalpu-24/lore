@@ -7,6 +7,7 @@
 //! state [`app`] draws.
 
 pub mod app;
+pub mod branches;
 pub mod diff;
 pub mod history;
 pub mod instance;

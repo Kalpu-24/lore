@@ -42,7 +42,12 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       side by side, cut at 1 MB per file. Opened with Diff on one selected file in Changes (working
       tree against the current revision), or by clicking a file of a revision in History
       (against its parent). Checked by hand against a local `loreserver`.
-- [ ] Branches: list, create, switch; merge with conflict list and resolve mine/theirs.
+- [x] Branches: list, create, switch; merge with conflict list and resolve mine/theirs. A
+      Branches view lists local and remote branches; Create (which moves the instance to the new
+      branch), Switch, and Merge into current. Conflicts list as Unmerged in Changes, with Keep
+      mine / Keep theirs, and Abort merge (confirmed) beside the merge notice; a commit finishes
+      the merge. Checked by hand against a local `loreserver`: create, switch, merge with a
+      conflict, abort, merge again, keep theirs, commit.
 
 ## Phase 4 — Collaboration
 - [ ] Locks view: holders, lock/unlock.

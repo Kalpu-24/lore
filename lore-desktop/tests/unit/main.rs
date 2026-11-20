@@ -3,6 +3,7 @@
 //! The crate's tests that can share a process, as one integration-test binary.
 
 mod app;
+mod branches;
 mod diff;
 mod history;
 mod status;
