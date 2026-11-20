@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: MIT
 //! `lore-desktop [INSTANCE_PATH]`: opens the desktop client, on the instance at the path if given.
 
+// A release build on Windows opens no console window beside the client's own. Its startup errors
+// then go nowhere; a debug build keeps the console to show them.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
 use lore_desktop::app::LoreDesktop;

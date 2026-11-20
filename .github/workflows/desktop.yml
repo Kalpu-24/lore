@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+# Builds and tests the desktop client on each platform it runs on, and keeps each platform's
+# release build as a downloadable archive of the run. The other workflows run on pull requests
+# only; this one also runs on pushes to main, where the client's changes land.
+name: Desktop client
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  desktop:
+    name: desktop (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read # Check out the source to build it
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, binary: lore-desktop, archive: tar.gz }
+          - { name: windows-x86_64, os: windows-latest, binary: lore-desktop.exe, archive: zip }
+          - { name: macos-aarch64, os: macos-latest, binary: lore-desktop, archive: tar.gz }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Build on /mnt, as the PR Validate workflow does: the runner's root filesystem is small.
+      - name: Build on the larger /mnt volume
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+
+      # The headers eframe's windowing builds against on Linux.
+      - name: Install the windowing libraries
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get update && sudo apt-get install --yes
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.name }}
+
+      - name: Unit tests
+        run: cargo test --release --package lore-desktop --test unit
+
+      - name: Build the client (release)
+        run: cargo build --release --package lore-desktop --bin lore-desktop
+
+      - name: Package
+        shell: bash
+        run: |
+          target="${CARGO_TARGET_DIR:-target}/release"
+          package="lore-desktop-${{ matrix.name }}"
+          mkdir -p "dist/$package"
+          cp "$target/${{ matrix.binary }}" LICENSE "dist/$package/"
+          cd dist
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a "$package.zip" "$package"
+          else
+            tar -czf "$package.tar.gz" "$package"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lore-desktop-${{ matrix.name }}
+          path: dist/lore-desktop-${{ matrix.name }}.${{ matrix.archive }}
+          if-no-files-found: error

@@ -5,10 +5,12 @@ Toolkit: egui/eframe, recorded in `docs/developing/decisions/00042-desktop-clien
 This fork is for personal use: no upstream review, sign-off or LEP acceptance gates.
 
 ## Phase 0 — Proposal
+
 - [x] Draft the LEP.
 - [ ] Fill its remaining `{TODO}`s.
 
 ## Phase 1 — Skeleton
+
 - [x] `lore-desktop` crate in the workspace; depends on `lore` only (plus egui).
 - [x] Toolkit ADR: egui.
 - [x] Plumbing: each call on its own thread via `run_command`, events copied into messages on a
@@ -20,6 +22,7 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       `deny.toml` exception for `epaint_default_fonts` (OFL-1.1, Ubuntu-font-1.0).
 
 ## Phase 2 — Daily loop
+
 - [x] Open/close instances (tabs), remembered in per-user config: eframe's `persistence`
       storage, saved on exit; the path given on the command line opens as the active tab.
 - [x] Changes view: status (virtualised), stage/unstage, revert, commit with message. Rows select
@@ -34,6 +37,7 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       against a local `loreserver`; login needs a server with auth configured and is unchecked.
 
 ## Phase 3 — History and branches
+
 - [x] History view; revision details. Built on `revision history` (entries with their message,
       time and creator) and `revision info` with deltas for the selected revision's files, both
       read beside the status call. Reloads after a commit, sync or push. Checked by hand against a
@@ -50,6 +54,7 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       conflict, abort, merge again, keep theirs, commit.
 
 ## Phase 4 — Collaboration
+
 - [x] Locks view: holders, lock/unlock. A Locks view lists the current branch's locks (path,
       holder, since), locks a typed path and releases the selected locks; Changes locks the
       selected files. Release names no owner, so the remote refuses locks the user doesn't hold.
@@ -62,10 +67,18 @@ This fork is for personal use: no upstream review, sign-off or LEP acceptance ga
       against a local `loreserver`: a clone's push, lock and unlock each arrived.
 
 ## Phase 5 — Ship
-- [ ] Packaging per platform; CI build of the client.
-- [ ] Docs: how-to page and tutorial; release note in `docs/release-notes/`.
+
+- [x] Packaging per platform; CI build of the client. `.github/workflows/desktop.yml` runs the
+      client's unit tests and release build on Linux, Windows and macOS for pushes to `main` and
+      pull requests, and keeps a `.zip` or `.tar.gz` of the binary and licence per platform as a
+      run artifact. A release build on Windows opens no console window. Installers, signing and a
+      macOS application bundle are left for when the client ships to others.
+- [x] Docs: how-to page and tutorial; release note in `docs/release-notes/`.
+      `docs/how-to/build-and-run-the-desktop-client.md`,
+      `docs/tutorials/work-in-the-desktop-client.md` and `docs/release-notes/desktop-client.md`.
 
 ## Each change
+
 Follow the repo's code standards: tests in `tests/unit/`, `cargo clippy --all-targets -- -D warnings --no-deps`.
 
 Run: `cargo run --release -p lore-desktop -- <instance path>`
